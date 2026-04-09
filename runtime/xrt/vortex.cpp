@@ -675,7 +675,7 @@ private:
     uint64_t bank_size = 1ull << lg2_bank_size_;
     uint32_t index = addr >> lg2_bank_size_;
     uint64_t offset = addr & (bank_size - 1);
-    if (index > num_banks) {
+    if (index >= num_banks) {
       fprintf(stderr, "[VXDRV] Error: address out of range: 0x%lx\n", addr);
       return -1;
     }

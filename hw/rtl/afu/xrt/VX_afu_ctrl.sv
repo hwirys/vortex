@@ -316,10 +316,12 @@ module VX_afu_ctrl import VX_gpu_pkg::*; #(
                 case (waddr)
                 ADDR_AP_CTRL: begin
                     if (s_axi_wstrb[0]) begin
-                        if (s_axi_wdata[0])
-                            ap_start_r <= 1;
-                        if (s_axi_wdata[4])
+                        if (s_axi_wdata[4]) begin
                             ap_reset_r <= 1;
+                            ap_start_r <= 0;
+                        end else if (s_axi_wdata[0]) begin
+                            ap_start_r <= 1;
+                        end
                         if (s_axi_wdata[7])
                             auto_restart_r <= 1;
                     end

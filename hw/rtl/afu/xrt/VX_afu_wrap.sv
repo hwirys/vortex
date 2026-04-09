@@ -104,6 +104,14 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
     wire [C_M_AXI_MEM_ID_WIDTH-1:0]      m_axi_mem_rid_a [C_M_AXI_MEM_NUM_BANKS];
     wire [1:0]                           m_axi_mem_rresp_a [C_M_AXI_MEM_NUM_BANKS];
 
+	// Internal AXI response signals for drain logic
+	// During vx_reset, stale responses from before the reset must be drained
+	// to prevent deadlock (reset caches have empty MSHRs and won't accept them)
+    wire                                 m_axi_mem_rvalid_vx [C_M_AXI_MEM_NUM_BANKS];
+    wire                                 m_axi_mem_rready_vx [C_M_AXI_MEM_NUM_BANKS];
+    wire                                 m_axi_mem_bvalid_vx [C_M_AXI_MEM_NUM_BANKS];
+    wire                                 m_axi_mem_bready_vx [C_M_AXI_MEM_NUM_BANKS];
+
 	// convert memory interface to array
 `ifdef PLATFORM_MERGED_MEMORY_INTERFACE
 	`REPEAT (1, AXI_MEM_TO_ARRAY, REPEAT_SEMICOLON);
@@ -218,7 +226,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 	end
 
 	for (genvar i = 0; i < C_M_AXI_MEM_NUM_BANKS; ++i) begin : g_m_axi_wr_rsp_fire
-		assign m_axi_wr_rsp_fire[i] = m_axi_mem_bvalid_a[i] && m_axi_mem_bready_a[i];
+		assign m_axi_wr_rsp_fire[i] = m_axi_mem_bvalid_vx[i] && m_axi_mem_bready_vx[i];
 	end
 
 	`POP_COUNT(cur_wr_reqs, m_axi_wr_req_fire);
@@ -228,7 +236,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 	                                                     (NUM_MEM_BANKS_SIZEW+1)'(cur_wr_rsps);
 
 	always @(posedge clk) begin
-		if (reset) begin
+		if (reset || ap_reset) begin
 			vx_pending_writes <= '0;
 		end else begin
 			vx_pending_writes <= vx_pending_writes + PENDING_WR_SIZEW'(reqs_sub);
@@ -291,6 +299,18 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 		assign m_axi_mem_araddr_a[i] = C_M_AXI_MEM_ADDR_WIDTH'(m_axi_mem_araddr_u[i]) + C_M_AXI_MEM_ADDR_WIDTH'(`PLATFORM_MEMORY_OFFSET);
 	end
 
+	// Drain stale AXI responses during vx_reset
+	// Force ready=1 to consume stale responses from NoC
+	// Block valid to Vortex to prevent stale data from corrupting reset state
+	for (genvar i = 0; i < C_M_AXI_MEM_NUM_BANKS; ++i) begin : g_rsp_drain
+		// read response drain
+		assign m_axi_mem_rready_a[i] = vx_reset ? 1'b1 : m_axi_mem_rready_vx[i];
+		assign m_axi_mem_rvalid_vx[i] = vx_reset ? 1'b0 : m_axi_mem_rvalid_a[i];
+		// write response drain
+		assign m_axi_mem_bready_a[i] = vx_reset ? 1'b1 : m_axi_mem_bready_vx[i];
+		assign m_axi_mem_bvalid_vx[i] = vx_reset ? 1'b0 : m_axi_mem_bvalid_a[i];
+	end
+
 	`SCOPE_IO_SWITCH (2);
 
 	Vortex_axi #(
@@ -323,8 +343,8 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 		.m_axi_wstrb	(m_axi_mem_wstrb_a),
 		.m_axi_wlast	(m_axi_mem_wlast_a),
 
-		.m_axi_bvalid	(m_axi_mem_bvalid_a),
-		.m_axi_bready	(m_axi_mem_bready_a),
+		.m_axi_bvalid	(m_axi_mem_bvalid_vx),
+		.m_axi_bready	(m_axi_mem_bready_vx),
 		.m_axi_bid		(m_axi_mem_bid_a),
 		.m_axi_bresp	(m_axi_mem_bresp_a),
 
@@ -341,8 +361,8 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 		`UNUSED_PIN (m_axi_arqos),
         `UNUSED_PIN (m_axi_arregion),
 
-		.m_axi_rvalid	(m_axi_mem_rvalid_a),
-		.m_axi_rready	(m_axi_mem_rready_a),
+		.m_axi_rvalid	(m_axi_mem_rvalid_vx),
+		.m_axi_rready	(m_axi_mem_rready_vx),
 		.m_axi_rdata	(m_axi_mem_rdata_a),
 		.m_axi_rlast	(m_axi_mem_rlast_a),
 		.m_axi_rid    	(m_axi_mem_rid_a),
