@@ -30,6 +30,25 @@
 `define VX_DCR_BASE_STATE(addr)         ((addr) - `VX_DCR_BASE_STATE_BEGIN)
 `define VX_DCR_BASE_STATE_COUNT         (`VX_DCR_BASE_STATE_END-`VX_DCR_BASE_STATE_BEGIN)
 
+// Per-bank PLATFORM_MEMORY_OFFSET<i> override (runtime). Each bank uses two
+// adjacent DCRs holding the lower and upper 32 bits of the offset. The AFU
+// snoops these and replaces the synthesis-time PLATFORM_MEMORY_OFFSET_<i>
+// macro values, allowing the host runtime to communicate the actual XRT bo
+// virtual address per bank without a re-build.
+`define VX_DCR_BASE_BANK_OFFSET_BEGIN   12'h100
+`define VX_DCR_BASE_BANK_OFFSET_LO0     12'h100
+`define VX_DCR_BASE_BANK_OFFSET_HI0     12'h101
+`define VX_DCR_BASE_BANK_OFFSET_LO1     12'h102
+`define VX_DCR_BASE_BANK_OFFSET_HI1     12'h103
+`define VX_DCR_BASE_BANK_OFFSET_LO2     12'h104
+`define VX_DCR_BASE_BANK_OFFSET_HI2     12'h105
+`define VX_DCR_BASE_BANK_OFFSET_LO3     12'h106
+`define VX_DCR_BASE_BANK_OFFSET_HI3     12'h107
+`define VX_DCR_BASE_BANK_OFFSET_END     12'h108
+// Helper: VX_DCR_BASE_BANK_OFFSET_LO(i) = base + i*2 ; HI = base + i*2 + 1
+`define VX_DCR_BASE_BANK_OFFSET_LO(i)   (`VX_DCR_BASE_BANK_OFFSET_BEGIN + (i)*2)
+`define VX_DCR_BASE_BANK_OFFSET_HI(i)   (`VX_DCR_BASE_BANK_OFFSET_BEGIN + (i)*2 + 1)
+
 // Machine Performance-monitoring counters classes ////////////////////////////
 
 `define VX_DCR_MPM_CLASS_NONE           0

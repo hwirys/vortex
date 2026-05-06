@@ -42,7 +42,7 @@ using namespace vortex;
 #define CPP_API
 #endif
 
-// #define BANK_INTERLEAVE
+#define BANK_INTERLEAVE
 
 #define MMIO_CTL_ADDR 0x00
 #define MMIO_DEV_ADDR 0x10
@@ -148,7 +148,7 @@ public:
     auto xrtDevice = xrt::device(device_index);
     auto uuid = xrtDevice.load_xclbin(xlbin_path_s);
     auto xrtKernel = xrt::ip(xrtDevice, uuid, KERNEL_NAME);
-    auto xclbin = xrt::xclbin(xlbin_path_s);
+    auto xclbin = xrt::xclbin(std::string(xlbin_path_s));
     auto device_name = xrtDevice.get_info<xrt::info::device::name>();
 
   #else
@@ -217,6 +217,18 @@ public:
 
     uint64_t bank_size;
     this->get_caps(VX_CAPS_MEM_BANK_SIZE, &bank_size);
+
+    // Path 1: cap per-bank xrt::bo allocation so 4 banks fit in host RAM.
+    // Override via VORTEX_BANK_SIZE env var (in bytes). Default 2 GiB / bank.
+    // Must cover STACK_BASE_ADDR's per-bank offset (~2 GiB for 4-bank interleave + XLEN=64).
+    if (const char *cap_s = getenv("VORTEX_BANK_SIZE")) {
+      uint64_t cap = strtoull(cap_s, nullptr, 0);
+      if (cap > 0 && cap < bank_size) bank_size = cap;
+    } else {
+      uint64_t default_cap = 2ull << 30; // 2 GiB
+      if (default_cap < bank_size) bank_size = default_cap;
+    }
+
     lg2_bank_size_ = log2ceil(bank_size);
 
     global_mem_size_ = num_banks * bank_size;
@@ -224,17 +236,56 @@ public:
     printf("info: device name=%s, memory_capacity=0x%lx bytes, memory_banks=%ld.\n", device_name.c_str(), global_mem_size_, num_banks);
 
   #ifdef BANK_INTERLEAVE
+    // Optional device-only mode (VORTEX_DEVICE_ONLY=1): allocate each bank's
+    // xrt::bo with flags::device_only so no host shadow buffer is reserved,
+    // letting all 64 GiB of U250 DDR4 (or 32 GiB of U200) be used regardless
+    // of host RAM. A single small staging xrt::bo (xrt::bo::flags::normal)
+    // routes upload/download via xrt::bo::copy.
+    device_only_ = false;
+    if (const char *e = getenv("VORTEX_DEVICE_ONLY")) {
+        device_only_ = (e[0] != '0');
+    }
+    if (device_only_) {
+        printf("info: device-only BO mode enabled (host shadow disabled)\n");
+    }
     xrtBuffers_.reserve(num_banks);
     for (uint32_t i = 0; i < num_banks; ++i) {
     #ifdef CPP_API
-      xrtBuffers_.emplace_back(xrtDevice_, bank_size, xrt::bo::flags::normal, i);
+      auto bo_flags = device_only_ ? xrt::bo::flags::device_only
+                                   : xrt::bo::flags::normal;
+      xrtBuffers_.emplace_back(xrtDevice_, bank_size, bo_flags, i);
+      uint64_t bank_va = xrtBuffers_.back().address();
+      printf("*** allocated bank%u/%lu, size=%lu, dev_addr=0x%lx%s\n",
+             i, num_banks, bank_size, bank_va,
+             device_only_ ? " (device-only)" : "");
+      // Push the per-bank XRT VA into the AFU's PLATFORM_MEMORY_OFFSET<i>
+      // DCR pair so internal AXI addresses land inside this bank's xrt::bo.
+      // The AFU snoops VX_DCR_BASE_BANK_OFFSET_{LO,HI}(i).
+      if (i < 4) {
+        CHECK_ERR(this->dcr_write(VX_DCR_BASE_BANK_OFFSET_LO(i), uint32_t(bank_va)), { return err; });
+        CHECK_ERR(this->dcr_write(VX_DCR_BASE_BANK_OFFSET_HI(i), uint32_t(bank_va >> 32)), { return err; });
+      }
     #else
       CHECK_HANDLE(xrtBuffer, xrtBOAlloc(xrtDevice_, bank_size, XRT_BO_FLAGS_NONE, i), {
          return -1;
       });
       xrtBuffers_.push_back(xrtBuffer);
+      printf("*** allocated bank%u/%lu, size=%lu\n", i, num_banks, bank_size);
     #endif
-      printf("*** allocated bank%u/%u, size=%lu\n", i, num_banks, bank_size);
+    }
+    if (device_only_) {
+    #ifdef CPP_API
+      // Staging BO sized to 64 MiB; lives on bank 0 since direction is
+      // host-side only (xrt::bo::flags::normal).
+      const uint64_t kStagingSize = 64ull << 20;
+      staging_bo_ = xrt::bo(xrtDevice_, kStagingSize, xrt::bo::flags::normal, 0);
+      staging_size_ = kStagingSize;
+      printf("*** staging BO allocated, size=%lu\n", kStagingSize);
+    #else
+      // C-API path not implemented for device-only mode.
+      fprintf(stderr, "VORTEX_DEVICE_ONLY only supported with CPP_API.\n");
+      return -1;
+    #endif
     }
   #endif
 
@@ -376,14 +427,9 @@ public:
       return err;
     });
   #ifdef BANK_INTERLEAVE
-    if (0 == global_mem_.allocated()) {
-    #ifndef CPP_API
-      for (auto &entry : xrtBuffers_) {
-        xrtBOFree(entry);
-      }
-    #endif
-      xrtBuffers_.clear();
-    }
+    // Keep per-bank xrt::bo handles alive for the lifetime of the device so a
+    // persistent host process can run multiple workloads back-to-back without
+    // re-allocating banks. They are torn down in dev_close().
   #else
     uint32_t bank_id;
     CHECK_ERR(this->get_bank_info(dev_addr, &bank_id, nullptr), {
@@ -521,37 +567,87 @@ public:
     if (dev_addr + asize > global_mem_size_)
       return -1;
 
-    for (uint64_t end = dev_addr + asize; dev_addr < end;
-         dev_addr += CACHE_BLOCK_SIZE, host_ptr += CACHE_BLOCK_SIZE) {
-    #ifdef BANK_INTERLEAVE
-      asize = CACHE_BLOCK_SIZE;
-    #else
-      end = 0;
-    #endif
+#ifdef BANK_INTERLEAVE
+    // Batch per-bank: write/copy each 64B block, but sync each bank's
+    // contiguous region only once — XRT sync is the kernel-DMA call,
+    // doing it 1× per bank instead of 1× per block is the dominant win.
+    uint32_t num_banks = 1u << lg2_num_banks_;
+    uint64_t num_blocks = asize / CACHE_BLOCK_SIZE;
+    std::vector<uint64_t> bank_first_off(num_banks, UINT64_MAX);
+    std::vector<uint64_t> bank_total(num_banks, 0);
+
+    for (uint64_t i = 0; i < num_blocks; ++i) {
       uint32_t bo_index;
       uint64_t bo_offset;
       xrt_buffer_t xrtBuffer;
-      CHECK_ERR(this->get_bank_info(dev_addr, &bo_index, &bo_offset), {
+      CHECK_ERR(this->get_bank_info(dev_addr + i * CACHE_BLOCK_SIZE, &bo_index, &bo_offset), {
         return err;
       });
       CHECK_ERR(this->get_buffer(bo_index, &xrtBuffer), {
         return err;
       });
+      if (bank_first_off[bo_index] == UINT64_MAX)
+        bank_first_off[bo_index] = bo_offset;
+      bank_total[bo_index] += CACHE_BLOCK_SIZE;
     #ifdef CPP_API
-      xrtBuffer.write(host_ptr, size, bo_offset);
-      xrtBuffer.sync(XCL_BO_SYNC_BO_TO_DEVICE, size, bo_offset);
+      if (device_only_) {
+        // Stage host data through the staging BO, then on-device copy.
+        staging_bo_.write(host_ptr + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE, 0);
+        staging_bo_.sync(XCL_BO_SYNC_BO_TO_DEVICE, CACHE_BLOCK_SIZE, 0);
+        xrtBuffer.copy(staging_bo_, CACHE_BLOCK_SIZE, 0, bo_offset);
+      } else {
+        xrtBuffer.write(host_ptr + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE, bo_offset);
+      }
     #else
-      CHECK_ERR(xrtBOWrite(xrtBuffer, host_ptr, size, bo_offset), {
+      CHECK_ERR(xrtBOWrite(xrtBuffer, host_ptr + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE, bo_offset), {
         dump_xrt_error(xrtDevice_, err);
         return err;
       });
-      CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_TO_DEVICE, size, bo_offset), {
+    #endif
+    }
+
+#ifdef CPP_API
+    if (!device_only_) {
+      for (uint32_t b = 0; b < num_banks; ++b) {
+        if (bank_total[b] == 0) continue;
+        xrt_buffer_t xrtBuffer;
+        CHECK_ERR(this->get_buffer(b, &xrtBuffer), { return err; });
+        xrtBuffer.sync(XCL_BO_SYNC_BO_TO_DEVICE, bank_total[b], bank_first_off[b]);
+      }
+    }
+#else
+    for (uint32_t b = 0; b < num_banks; ++b) {
+      if (bank_total[b] == 0) continue;
+      xrt_buffer_t xrtBuffer;
+      CHECK_ERR(this->get_buffer(b, &xrtBuffer), { return err; });
+      CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_TO_DEVICE, bank_total[b], bank_first_off[b]), {
         dump_xrt_error(xrtDevice_, err);
         return err;
       });
+    }
 #endif
+    return 0;
+#else
+    {
+      uint32_t bo_index;
+      uint64_t bo_offset;
+      xrt_buffer_t xrtBuffer;
+      CHECK_ERR(this->get_bank_info(dev_addr, &bo_index, &bo_offset), { return err; });
+      CHECK_ERR(this->get_buffer(bo_index, &xrtBuffer), { return err; });
+    #ifdef CPP_API
+      xrtBuffer.write(host_ptr, asize, bo_offset);
+      xrtBuffer.sync(XCL_BO_SYNC_BO_TO_DEVICE, asize, bo_offset);
+    #else
+      CHECK_ERR(xrtBOWrite(xrtBuffer, host_ptr, asize, bo_offset), {
+        dump_xrt_error(xrtDevice_, err); return err;
+      });
+      CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_TO_DEVICE, asize, bo_offset), {
+        dump_xrt_error(xrtDevice_, err); return err;
+      });
+    #endif
     }
     return 0;
+#endif
   }
 
   int download(void *dest, uint64_t dev_addr, uint64_t size) {
@@ -567,37 +663,92 @@ public:
     if (dev_addr + asize > global_mem_size_)
       return -1;
 
-    for (uint64_t end = dev_addr + asize; dev_addr < end;
-         dev_addr += CACHE_BLOCK_SIZE, host_ptr += CACHE_BLOCK_SIZE) {
-    #ifdef BANK_INTERLEAVE
-      asize = CACHE_BLOCK_SIZE;
-    #else
-      end = 0;
-    #endif
+#ifdef BANK_INTERLEAVE
+    // 1× sync per bank covers the contiguous range; then memcpy each block
+    // from BO host shadow to its (interleaved) position in dest.
+    uint32_t num_banks = 1u << lg2_num_banks_;
+    uint64_t num_blocks = asize / CACHE_BLOCK_SIZE;
+    std::vector<uint64_t> bank_first_off(num_banks, UINT64_MAX);
+    std::vector<uint64_t> bank_total(num_banks, 0);
+
+    for (uint64_t i = 0; i < num_blocks; ++i) {
       uint32_t bo_index;
       uint64_t bo_offset;
+      CHECK_ERR(this->get_bank_info(dev_addr + i * CACHE_BLOCK_SIZE, &bo_index, &bo_offset), {
+        return err;
+      });
+      if (bank_first_off[bo_index] == UINT64_MAX)
+        bank_first_off[bo_index] = bo_offset;
+      bank_total[bo_index] += CACHE_BLOCK_SIZE;
+    }
+
+#ifdef CPP_API
+    if (!device_only_) {
+      for (uint32_t b = 0; b < num_banks; ++b) {
+        if (bank_total[b] == 0) continue;
+        xrt_buffer_t xrtBuffer;
+        CHECK_ERR(this->get_buffer(b, &xrtBuffer), { return err; });
+        xrtBuffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE, bank_total[b], bank_first_off[b]);
+      }
+    }
+#else
+    for (uint32_t b = 0; b < num_banks; ++b) {
+      if (bank_total[b] == 0) continue;
       xrt_buffer_t xrtBuffer;
-      CHECK_ERR(this->get_bank_info(dev_addr, &bo_index, &bo_offset), {
-        return err;
-      });
-      CHECK_ERR(this->get_buffer(bo_index, &xrtBuffer), {
-        return err;
-      });
-    #ifdef CPP_API
-      xrtBuffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE, size, bo_offset);
-      xrtBuffer.read(host_ptr, size, bo_offset);
-    #else
-      CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_FROM_DEVICE, size, bo_offset), {
+      CHECK_ERR(this->get_buffer(b, &xrtBuffer), { return err; });
+      CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_FROM_DEVICE, bank_total[b], bank_first_off[b]), {
         dump_xrt_error(xrtDevice_, err);
         return err;
       });
-      CHECK_ERR(xrtBORead(xrtBuffer, host_ptr, size, bo_offset), {
+    }
+#endif
+
+    for (uint64_t i = 0; i < num_blocks; ++i) {
+      uint32_t bo_index;
+      uint64_t bo_offset;
+      xrt_buffer_t xrtBuffer;
+      CHECK_ERR(this->get_bank_info(dev_addr + i * CACHE_BLOCK_SIZE, &bo_index, &bo_offset), {
+        return err;
+      });
+      CHECK_ERR(this->get_buffer(bo_index, &xrtBuffer), { return err; });
+    #ifdef CPP_API
+      if (device_only_) {
+        // device_only retains the per-block staging path (no host shadow).
+        staging_bo_.copy(xrtBuffer, CACHE_BLOCK_SIZE, bo_offset, 0);
+        staging_bo_.sync(XCL_BO_SYNC_BO_FROM_DEVICE, CACHE_BLOCK_SIZE, 0);
+        staging_bo_.read(host_ptr + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE, 0);
+      } else {
+        xrtBuffer.read(host_ptr + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE, bo_offset);
+      }
+    #else
+      CHECK_ERR(xrtBORead(xrtBuffer, host_ptr + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE, bo_offset), {
         dump_xrt_error(xrtDevice_, err);
         return err;
       });
     #endif
     }
     return 0;
+#else
+    {
+      uint32_t bo_index;
+      uint64_t bo_offset;
+      xrt_buffer_t xrtBuffer;
+      CHECK_ERR(this->get_bank_info(dev_addr, &bo_index, &bo_offset), { return err; });
+      CHECK_ERR(this->get_buffer(bo_index, &xrtBuffer), { return err; });
+    #ifdef CPP_API
+      xrtBuffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE, asize, bo_offset);
+      xrtBuffer.read(host_ptr, asize, bo_offset);
+    #else
+      CHECK_ERR(xrtBOSync(xrtBuffer, XCL_BO_SYNC_BO_FROM_DEVICE, asize, bo_offset), {
+        dump_xrt_error(xrtDevice_, err); return err;
+      });
+      CHECK_ERR(xrtBORead(xrtBuffer, host_ptr, asize, bo_offset), {
+        dump_xrt_error(xrtDevice_, err); return err;
+      });
+    #endif
+    }
+    return 0;
+#endif
   }
 
   int start(uint64_t krnl_addr, uint64_t args_addr) {
@@ -639,6 +790,11 @@ public:
     // to milliseconds
     uint64_t sleep_time_ms = (sleep_time.tv_sec * 1000) + (sleep_time.tv_nsec / 1000000);
 
+    // Diagnostic: log MMIO state every 2 seconds when env var is set.
+    bool diag = (getenv("VORTEX_DEBUG_HANG") != nullptr);
+    uint64_t elapsed_ms = 0;
+    uint64_t next_log_ms = 0;
+
     for (;;) {
       uint32_t status = 0;
       CHECK_ERR(this->read_register(MMIO_CTL_ADDR, &status), {
@@ -647,11 +803,34 @@ public:
       bool is_done = (status & CTL_AP_DONE) == CTL_AP_DONE;
       if (is_done)
         break;
+
+      if (diag && elapsed_ms >= next_log_ms) {
+        uint32_t scp_lo = 0, scp_hi = 0, isa_lo = 0, isa_hi = 0;
+        uint32_t dev_lo = 0, dev_hi = 0;
+        this->read_register(MMIO_SCP_ADDR, &scp_lo);
+        this->read_register(MMIO_SCP_ADDR + 4, &scp_hi);
+        this->read_register(MMIO_ISA_ADDR, &isa_lo);
+        this->read_register(MMIO_ISA_ADDR + 4, &isa_hi);
+        this->read_register(MMIO_DEV_ADDR, &dev_lo);
+        this->read_register(MMIO_DEV_ADDR + 4, &dev_hi);
+        fprintf(stderr,
+                "[hang-debug @ %lums] CTL=0x%08x (start=%d done=%d idle=%d ready=%d) "
+                "SCP=0x%08x_%08x ISA=0x%08x_%08x DEV=0x%08x_%08x\n",
+                elapsed_ms,
+                status,
+                (status >> 0) & 1, (status >> 1) & 1,
+                (status >> 2) & 1, (status >> 3) & 1,
+                scp_hi, scp_lo, isa_hi, isa_lo, dev_hi, dev_lo);
+        fflush(stderr);
+        next_log_ms = elapsed_ms + 2000;
+      }
+
       if (0 == timeout) {
         return -1;
       }
       nanosleep(&sleep_time, nullptr);
       timeout -= sleep_time_ms;
+      elapsed_ms += sleep_time_ms;
     };
 
     return 0;
@@ -698,6 +877,11 @@ private:
   std::unordered_map<uint32_t, std::array<uint64_t, 32>> mpm_cache_;
   uint32_t lg2_num_banks_;
   uint32_t lg2_bank_size_;
+  bool device_only_ = false;
+#ifdef CPP_API
+  xrt::bo staging_bo_;
+  uint64_t staging_size_ = 0;
+#endif
 
 #ifdef BANK_INTERLEAVE
 
@@ -720,7 +904,12 @@ private:
 
   int get_buffer(uint32_t bank_id, xrt_buffer_t *pBuf) {
     if (pBuf) {
-      *pBuf = xrtBuffers_.at(bank_id);
+      if (bank_id >= xrtBuffers_.size()) {
+        // Vector was cleared (post-cleanup) or bank_id out of range.
+        // Return zero-initialized buffer to avoid throw during teardown.
+        return -1;
+      }
+      *pBuf = xrtBuffers_[bank_id];
     }
     return 0;
   }
