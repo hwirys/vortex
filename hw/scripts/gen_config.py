@@ -50,7 +50,13 @@ translation_rules = [
     (re.compile(r"\d+'d(\d+)"), r'\1'),
     (re.compile(r"\d+'b([01]+)"), r'0b\1'),
     (re.compile(r"128'h([\da-fA-F_]+)"), r'"\1"'),
-    (re.compile(r"\d+'h([\da-fA-F]+)"), r'0x\1')    
+    (re.compile(r"\d+'h([\da-fA-F]+)"), r'0x\1'),
+
+    # SV size cast: 12'(x) or IDENT'(x) — drop the size prefix; C arithmetic
+    # is plain int so the cast is meaningless on the host side. This runs
+    # after the backtick-strip rule above, so `IDENT'(x) has already become
+    # IDENT'(x).
+    (re.compile(r"\b\w+'\("), r'('),
 ]
 
 with open(args.output, 'w') as f:

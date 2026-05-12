@@ -293,34 +293,28 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 	//
 	// The values are loaded from DCRs (VX_DCR_BASE_BANK_OFFSET_LO/HI(i)) at
 	// runtime so the host can communicate the actual XRT-allocated VA per
-	// bank. They reset to the synthesis-time PLATFORM_MEMORY_OFFSET_<i>
-	// macros so a host that doesn't write the DCRs still sees the legacy
-	// behaviour.
-	reg  [63:0] bank_offset_q [4];
-	wire [C_M_AXI_MEM_ADDR_WIDTH-1:0] platform_memory_offsets [4];
+	// bank. They reset to the synthesis-time PLATFORM_MEMORY_OFFSET so a host
+	// that doesn't write the DCRs still sees the legacy behaviour.
+	reg  [63:0] bank_offset_q [C_M_AXI_MEM_NUM_BANKS];
+	wire [C_M_AXI_MEM_ADDR_WIDTH-1:0] platform_memory_offsets [C_M_AXI_MEM_NUM_BANKS];
 
-	always @(posedge clk) begin
-		if (reset) begin
-			bank_offset_q[0] <= 64'(`PLATFORM_MEMORY_OFFSET_0);
-			bank_offset_q[1] <= 64'(`PLATFORM_MEMORY_OFFSET_1);
-			bank_offset_q[2] <= 64'(`PLATFORM_MEMORY_OFFSET_2);
-			bank_offset_q[3] <= 64'(`PLATFORM_MEMORY_OFFSET_3);
-		end else if (dcr_wr_valid) begin
-			case (dcr_wr_addr)
-				`VX_DCR_BASE_BANK_OFFSET_LO0: bank_offset_q[0][31:0]  <= dcr_wr_data;
-				`VX_DCR_BASE_BANK_OFFSET_HI0: bank_offset_q[0][63:32] <= dcr_wr_data;
-				`VX_DCR_BASE_BANK_OFFSET_LO1: bank_offset_q[1][31:0]  <= dcr_wr_data;
-				`VX_DCR_BASE_BANK_OFFSET_HI1: bank_offset_q[1][63:32] <= dcr_wr_data;
-				`VX_DCR_BASE_BANK_OFFSET_LO2: bank_offset_q[2][31:0]  <= dcr_wr_data;
-				`VX_DCR_BASE_BANK_OFFSET_HI2: bank_offset_q[2][63:32] <= dcr_wr_data;
-				`VX_DCR_BASE_BANK_OFFSET_LO3: bank_offset_q[3][31:0]  <= dcr_wr_data;
-				`VX_DCR_BASE_BANK_OFFSET_HI3: bank_offset_q[3][63:32] <= dcr_wr_data;
-				default:;
-			endcase
+	for (genvar i = 0; i < C_M_AXI_MEM_NUM_BANKS; ++i) begin : g_bank_offset
+		localparam [`VX_DCR_ADDR_BITS-1:0] DCR_LO = `VX_DCR_BASE_BANK_OFFSET_LO(i);
+		localparam [`VX_DCR_ADDR_BITS-1:0] DCR_HI = `VX_DCR_BASE_BANK_OFFSET_HI(i);
+		always @(posedge clk) begin
+			if (reset) begin
+				bank_offset_q[i] <= 64'(`PLATFORM_MEMORY_OFFSET);
+			end else if (dcr_wr_valid) begin
+				if (dcr_wr_addr == DCR_LO) begin
+					bank_offset_q[i][31:0]  <= dcr_wr_data;
+				end else if (dcr_wr_addr == DCR_HI) begin
+					bank_offset_q[i][63:32] <= dcr_wr_data;
+				end
+			end
 		end
 	end
 
-	for (genvar i = 0; i < 4; ++i) begin : g_pmo
+	for (genvar i = 0; i < C_M_AXI_MEM_NUM_BANKS; ++i) begin : g_pmo
 		assign platform_memory_offsets[i] = bank_offset_q[i][C_M_AXI_MEM_ADDR_WIDTH-1:0];
 	end
 

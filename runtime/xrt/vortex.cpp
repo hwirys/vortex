@@ -260,8 +260,11 @@ public:
              device_only_ ? " (device-only)" : "");
       // Push the per-bank XRT VA into the AFU's PLATFORM_MEMORY_OFFSET<i>
       // DCR pair so internal AXI addresses land inside this bank's xrt::bo.
-      // The AFU snoops VX_DCR_BASE_BANK_OFFSET_{LO,HI}(i).
-      if (i < 4) {
+      // The AFU snoops VX_DCR_BASE_BANK_OFFSET_{LO,HI}(i). Banks beyond the
+      // AFU's C_M_AXI_MEM_NUM_BANKS land at unused DCR addresses and are
+      // harmlessly ignored (e.g. HBM-merged platforms where one AXI master
+      // fronts 32 channels).
+      if (i < VX_DCR_BASE_BANK_OFFSET_MAX) {
         CHECK_ERR(this->dcr_write(VX_DCR_BASE_BANK_OFFSET_LO(i), uint32_t(bank_va)), { return err; });
         CHECK_ERR(this->dcr_write(VX_DCR_BASE_BANK_OFFSET_HI(i), uint32_t(bank_va >> 32)), { return err; });
       }
